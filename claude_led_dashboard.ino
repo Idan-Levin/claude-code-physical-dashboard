@@ -114,6 +114,22 @@ void handleCommand(String cmd) {
     return;
   }
 
+  if (cmd == "test") {
+    for (int i = 0; i < NUM_SLOTS; i++) slotState[i] = OFF;
+    renderAll();
+    for (int i = 0; i < NUM_SLOTS; i++) {
+      digitalWrite(pins[i][0], HIGH);
+      delay(600);
+      digitalWrite(pins[i][0], LOW);
+      digitalWrite(pins[i][1], HIGH);
+      delay(600);
+      digitalWrite(pins[i][1], LOW);
+      delay(300);
+    }
+    Serial.println("ok test");
+    return;
+  }
+
   int colon = cmd.indexOf(':');
   if (colon < 1) {
     Serial.print("err bad cmd: ");

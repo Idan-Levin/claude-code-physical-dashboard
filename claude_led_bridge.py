@@ -2,30 +2,36 @@
 """
 claude_led_bridge.py
 
-Reads a Claude Code hook event from stdin and sends the right command
-to the Arduino over USB serial. Configured via .claude/settings.json hooks.
+Reads a Claude Code hook event from stdin and forwards the right command
+to the LED daemon over a Unix domain socket. Configured via Claude Code
+hooks in settings.json.
+
+The daemon (claude_led_daemon.py) owns the USB serial connection so we
+don't reset the Arduino on every hook invocation. This script auto-spawns
+the daemon if it isn't already running.
 
 Maintains a tiny state file at ~/.claude-led/state.json that maps
-session_id -> slot number (1..NUM_SLOTS), on a first-come-first-served
-basis. Sessions that arrive when all slots are full are ignored.
+session_id -> slot number (1..NUM_SLOTS), first-come-first-served.
+Sessions that arrive when all slots are full are ignored.
 """
 
 import json
 import os
+import socket
+import subprocess
 import sys
 import time
 from pathlib import Path
 
-import serial  # pip install pyserial
-
 # --- Config ---------------------------------------------------------------
 
 NUM_SLOTS = 4
-SERIAL_PORT = os.environ.get("CLAUDE_LED_PORT", "/dev/tty.usbmodem1101")
-BAUD = 9600
 STATE_DIR = Path.home() / ".claude-led"
 STATE_FILE = STATE_DIR / "state.json"
 LOG_FILE = STATE_DIR / "bridge.log"
+SOCK_PATH = str(STATE_DIR / "daemon.sock")
+PID_FILE = STATE_DIR / "daemon.pid"
+DAEMON_SCRIPT = Path(__file__).resolve().parent / "claude_led_daemon.py"
 
 # --- State helpers --------------------------------------------------------
 
@@ -35,7 +41,6 @@ def load_state():
     try:
         with STATE_FILE.open() as f:
             s = json.load(f)
-        # Backfill if length changed
         while len(s.get("slots", [])) < NUM_SLOTS:
             s["slots"].append(None)
         return s
@@ -53,34 +58,65 @@ def log(msg):
         f.write(f"{time.strftime('%H:%M:%S')} {msg}\n")
 
 def slot_for(session_id, state, assign=True):
-    """Return 1..NUM_SLOTS for this session, or None if full and not assigning."""
     if session_id in state["slots"]:
         return state["slots"].index(session_id) + 1
     if not assign:
         return None
-    # Reap stale slots: any session not seen in 6 hours gets evicted
     now = time.time()
     for i, sid in enumerate(state["slots"]):
-        if sid and now - state["last_seen"].get(sid, 0) > 6 * 3600:
+        if sid and now - state["last_seen"].get(sid, 0) > 30 * 60:
+            log(f"evicting stale session {sid[:8]} from slot {i + 1}")
+            send(i + 1, "off")
             state["slots"][i] = None
-    # Assign first free slot
     for i, sid in enumerate(state["slots"]):
         if sid is None:
             state["slots"][i] = session_id
             return i + 1
     return None
 
-# --- Serial ---------------------------------------------------------------
+# --- Daemon comms ---------------------------------------------------------
+
+def daemon_alive():
+    if not PID_FILE.exists():
+        return False
+    try:
+        pid = int(PID_FILE.read_text().strip())
+        os.kill(pid, 0)
+        return os.path.exists(SOCK_PATH)
+    except Exception:
+        return False
+
+def spawn_daemon():
+    try:
+        subprocess.Popen(
+            [sys.executable, str(DAEMON_SCRIPT)],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            env=os.environ.copy(),
+        )
+    except Exception as e:
+        log(f"spawn error: {e}")
+        return False
+    # Daemon binds socket before the 2.5s Arduino boot wait,
+    # so the socket should appear quickly (under ~200ms).
+    for _ in range(50):
+        if os.path.exists(SOCK_PATH):
+            return True
+        time.sleep(0.1)
+    return os.path.exists(SOCK_PATH)
 
 def send(slot, state_name):
+    if not daemon_alive():
+        if not spawn_daemon():
+            log("daemon failed to start")
+            return
     try:
-        with serial.Serial(SERIAL_PORT, BAUD, timeout=1) as ser:
-            # Arduino resets on connect; give it a moment
-            time.sleep(2)
-            ser.write(f"{slot}:{state_name}\n".encode())
-            ser.flush()
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as s:
+            s.sendto(f"{slot}:{state_name}".encode(), SOCK_PATH)
     except Exception as e:
-        log(f"serial error: {e}")
+        log(f"sendto error: {e}")
 
 # --- Main -----------------------------------------------------------------
 
@@ -89,7 +125,7 @@ def main():
         payload = json.load(sys.stdin)
     except Exception as e:
         log(f"bad stdin: {e}")
-        sys.exit(0)  # never block Claude
+        sys.exit(0)
 
     event = payload.get("hook_event_name") or os.environ.get("CLAUDE_HOOK_EVENT", "")
     session_id = payload.get("session_id", "unknown")
@@ -97,7 +133,6 @@ def main():
     state = load_state()
     state["last_seen"][session_id] = time.time()
 
-    # Figure out which LED state this event maps to
     led_state = None
     if event == "SessionStart":
         led_state = "idle"
@@ -116,17 +151,19 @@ def main():
         save_state(state)
         sys.exit(0)
 
-    assign = led_state != "off"
+    # Only SessionStart is allowed to claim a new slot. Any other event for
+    # a session that doesn't already own a slot is stale (e.g. a late
+    # Notification firing after SessionEnd) and must not re-animate the LED.
+    assign = event == "SessionStart"
     slot = slot_for(session_id, state, assign=assign)
     if slot is None:
-        log(f"no slot available for session {session_id[:8]} ({event})")
+        log(f"no slot for session {session_id[:8]} ({event}) — ignoring")
         save_state(state)
         sys.exit(0)
 
     log(f"slot {slot} <- {led_state} ({event}, session {session_id[:8]})")
     send(slot, led_state)
 
-    # On SessionEnd, free the slot AFTER sending "off" so the Arduino actually turns it off
     if event == "SessionEnd" and session_id in state["slots"]:
         i = state["slots"].index(session_id)
         state["slots"][i] = None
