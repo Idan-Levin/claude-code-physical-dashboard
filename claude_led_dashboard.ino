@@ -89,32 +89,45 @@ void renderAll() {
   for (int i = 0; i < NUM_SLOTS; i++) renderSlot(i);
 }
 
-State parseState(const String& s) {
-  if (s == "off")     return OFF;
-  if (s == "idle")    return IDLE;
-  if (s == "working") return WORKING;
-  if (s == "waiting") return WAITING;
-  if (s == "alert")   return ALERT;
-  return OFF;
+// parseState returns true on success; writes result to *out. Unknown state
+// is rejected (returns false) rather than silently mapped to OFF, so a
+// malformed command doesn't quietly dark a live slot.
+bool parseState(const char* s, State* out) {
+  if (strcmp(s, "off") == 0)     { *out = OFF;     return true; }
+  if (strcmp(s, "idle") == 0)    { *out = IDLE;    return true; }
+  if (strcmp(s, "working") == 0) { *out = WORKING; return true; }
+  if (strcmp(s, "waiting") == 0) { *out = WAITING; return true; }
+  if (strcmp(s, "alert") == 0)   { *out = ALERT;   return true; }
+  return false;
 }
 
-void handleCommand(String cmd) {
-  cmd.trim();
-  if (cmd.length() == 0) return;
+// trim leading/trailing whitespace in-place. Returns pointer to trimmed start.
+char* trimInPlace(char* s) {
+  while (*s == ' ' || *s == '\t') s++;
+  size_t len = strlen(s);
+  while (len > 0 && (s[len - 1] == ' ' || s[len - 1] == '\t')) {
+    s[--len] = '\0';
+  }
+  return s;
+}
 
-  if (cmd == "ping") {
+void handleCommand(char* cmd) {
+  cmd = trimInPlace(cmd);
+  if (*cmd == '\0') return;
+
+  if (strcmp(cmd, "ping") == 0) {
     Serial.println("pong");
     return;
   }
 
-  if (cmd == "reset") {
+  if (strcmp(cmd, "reset") == 0) {
     for (int i = 0; i < NUM_SLOTS; i++) slotState[i] = OFF;
     renderAll();
     Serial.println("ok reset");
     return;
   }
 
-  if (cmd == "test") {
+  if (strcmp(cmd, "test") == 0) {
     for (int i = 0; i < NUM_SLOTS; i++) slotState[i] = OFF;
     renderAll();
     for (int i = 0; i < NUM_SLOTS; i++) {
@@ -130,15 +143,26 @@ void handleCommand(String cmd) {
     return;
   }
 
-  int colon = cmd.indexOf(':');
-  if (colon < 1) {
+  char* colon = strchr(cmd, ':');
+  if (colon == NULL || colon == cmd) {
     Serial.print("err bad cmd: ");
     Serial.println(cmd);
     return;
   }
 
-  int slot = cmd.substring(0, colon).toInt();
-  String stateStr = cmd.substring(colon + 1);
+  // Validate the slot field is all digits before atoi (so "1abc" doesn't
+  // silently parse as 1).
+  for (char* p = cmd; p < colon; p++) {
+    if (*p < '0' || *p > '9') {
+      Serial.print("err bad slot: ");
+      Serial.println(cmd);
+      return;
+    }
+  }
+
+  *colon = '\0';
+  int slot = atoi(cmd);
+  const char* stateStr = colon + 1;
 
   if (slot < 1 || slot > NUM_SLOTS) {
     Serial.print("err bad slot: ");
@@ -146,10 +170,19 @@ void handleCommand(String cmd) {
     return;
   }
 
-  slotState[slot - 1] = parseState(stateStr);
+  State parsed;
+  if (!parseState(stateStr, &parsed)) {
+    Serial.print("err bad state: ");
+    Serial.println(stateStr);
+    return;
+  }
+
+  slotState[slot - 1] = parsed;
   renderSlot(slot - 1);
   Serial.print("ok ");
-  Serial.println(cmd);
+  Serial.print(slot);
+  Serial.print(":");
+  Serial.println(stateStr);
 }
 
 void loop() {
@@ -171,15 +204,30 @@ void loop() {
     }
   }
 
-  static String buf;
+  // Fixed char buffer instead of dynamic String to avoid AVR heap fragmentation.
+  // Overflow (line > 64 bytes) latches until the next newline, so we don't
+  // silently act on a truncated command.
+  static char buf[65];
+  static uint8_t buflen = 0;
+  static bool overflowed = false;
+
   while (Serial.available() > 0) {
     char c = Serial.read();
     if (c == '\n') {
-      handleCommand(buf);
-      buf = "";
+      if (overflowed) {
+        Serial.println("err overflow");
+      } else {
+        buf[buflen] = '\0';
+        handleCommand(buf);
+      }
+      buflen = 0;
+      overflowed = false;
     } else if (c != '\r') {
-      buf += c;
-      if (buf.length() > 64) buf = "";
+      if (buflen < sizeof(buf) - 1) {
+        buf[buflen++] = c;
+      } else {
+        overflowed = true;
+      }
     }
   }
 }
