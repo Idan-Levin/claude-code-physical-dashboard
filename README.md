@@ -67,10 +67,15 @@ Open `claude_led_dashboard.ino` in the Arduino IDE, select your Mega and port, a
 ### 2. Find the serial port
 
 ```bash
-ls /dev/tty.usbmodem* /dev/tty.usbserial*
+# macOS: prefer /dev/cu.* (non-blocking opens; /dev/tty.* blocks on DCD)
+ls /dev/cu.usbmodem* /dev/cu.usbserial* 2>/dev/null
+# Linux:
+ls /dev/ttyACM* /dev/ttyUSB* 2>/dev/null
 ```
 
-Copy the path (e.g. `/dev/tty.usbmodem11301`).
+Copy the path (e.g. `/dev/cu.usbmodem11301` on macOS, `/dev/ttyACM0` on Linux).
+If `$CLAUDE_LED_PORT` isn't set, the daemon auto-detects via pyserial VIDs
+and falls back to globbing these paths.
 
 ### 3. Install the bridge
 

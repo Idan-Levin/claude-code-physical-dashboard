@@ -8,12 +8,19 @@ them to serial. Keeping the port open avoids the per-invocation DTR pulse
 that resets the Arduino and causes the boot-animation flicker.
 
 Auto-spawned by claude_led_bridge.py when not running.
+
+Singleton is enforced with fcntl.flock on ~/.claude-led/daemon.lock held
+for the daemon's lifetime — prevents double-spawn races that PID files
+alone cannot (stale PID reuse, two bridges both seeing "no daemon").
 """
 
+import errno
+import fcntl
 import glob
 import os
 import signal
 import socket
+import stat
 import sys
 import time
 from pathlib import Path
@@ -22,6 +29,12 @@ import serial
 from serial.tools import list_ports
 
 BAUD = 9600
+
+STATE_DIR = Path.home() / ".claude-led"
+SOCK_PATH = str(STATE_DIR / "daemon.sock")
+PID_FILE = STATE_DIR / "daemon.pid"
+LOCK_FILE = STATE_DIR / "daemon.lock"
+LOG_FILE = STATE_DIR / "daemon.log"
 
 
 def find_serial_port():
@@ -39,7 +52,7 @@ def find_serial_port():
     arduino_vids = {0x2341, 0x2A03, 0x1A86, 0x0403, 0x10C4}
     candidates = list(list_ports.comports())
     for p in candidates:
-        if p.vid in arduino_vids:
+        if p.vid in arduino_vids and p.device:
             return p.device
     for p in candidates:
         dev = p.device or ""
@@ -55,15 +68,31 @@ def find_serial_port():
             return hits[0]
 
     return None
-STATE_DIR = Path.home() / ".claude-led"
-SOCK_PATH = str(STATE_DIR / "daemon.sock")
-PID_FILE = STATE_DIR / "daemon.pid"
-LOG_FILE = STATE_DIR / "daemon.log"
+
+
+def _ensure_state_dir():
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(STATE_DIR, 0o700)
+    except OSError:
+        pass
 
 
 def log(msg):
-    with LOG_FILE.open("a") as f:
-        f.write(f"{time.strftime('%H:%M:%S')} {msg}\n")
+    try:
+        _ensure_state_dir()
+        with LOG_FILE.open("a") as f:
+            f.write(f"{time.strftime('%H:%M:%S')} {msg}\n")
+        try:
+            os.chmod(LOG_FILE, 0o600)
+        except OSError:
+            pass
+    except Exception:
+        # Best effort: if disk is full or perms are wrong, fall back to stderr.
+        try:
+            sys.stderr.write(f"daemon log failed: {msg}\n")
+        except Exception:
+            pass
 
 
 def open_serial():
@@ -88,23 +117,53 @@ def open_serial():
     return s, port
 
 
-def already_running():
-    if not PID_FILE.exists():
-        return False
+def acquire_singleton():
+    """Return an open lock fd on success, or None if another daemon is running."""
+    _ensure_state_dir()
+    fd = os.open(str(LOCK_FILE), os.O_RDWR | os.O_CREAT, 0o600)
     try:
-        pid = int(PID_FILE.read_text().strip())
-        os.kill(pid, 0)
-        return True
-    except (ProcessLookupError, ValueError, PermissionError, OSError):
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        return None
+    try:
+        os.fchmod(fd, 0o600)
+    except OSError:
+        pass
+    # Write our PID into the lock file for debugging; held fd keeps the lock.
+    try:
+        os.lseek(fd, 0, os.SEEK_SET)
+        os.ftruncate(fd, 0)
+        os.write(fd, f"{os.getpid()}\n".encode())
+    except OSError:
+        pass
+    return fd
+
+
+def _is_our_socket(path):
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
         return False
+    except OSError:
+        return False
+    if stat.S_ISLNK(st.st_mode):
+        return False
+    return stat.S_ISSOCK(st.st_mode)
+
+
+def _safe_unlink_socket(path):
+    """Only unlink SOCK_PATH if it's a real socket (not a symlink or regular file)."""
+    if _is_our_socket(path):
+        try: os.unlink(path)
+        except OSError: pass
 
 
 def cleanup(sock=None, ser=None):
     if sock is not None:
         try: sock.close()
         except Exception: pass
-    try: os.unlink(SOCK_PATH)
-    except OSError: pass
+    _safe_unlink_socket(SOCK_PATH)
     if ser is not None:
         try: ser.close()
         except Exception: pass
@@ -113,21 +172,36 @@ def cleanup(sock=None, ser=None):
 
 
 def main():
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    _ensure_state_dir()
 
-    if already_running():
+    lock_fd = acquire_singleton()
+    if lock_fd is None:
+        # Another daemon already holds the lock; nothing to do.
         sys.exit(0)
 
-    PID_FILE.write_text(str(os.getpid()))
+    # Write PID for debugging/observability only (not used for aliveness).
+    try:
+        PID_FILE.write_text(str(os.getpid()))
+        os.chmod(PID_FILE, 0o600)
+    except OSError:
+        pass
 
-    # Fresh socket
-    if os.path.exists(SOCK_PATH):
-        try: os.unlink(SOCK_PATH)
-        except OSError: pass
+    # We hold the lock, so any stale socket at SOCK_PATH is ours to clean up.
+    _safe_unlink_socket(SOCK_PATH)
 
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
-    sock.bind(SOCK_PATH)
-    os.chmod(SOCK_PATH, 0o600)
+    try:
+        sock.bind(SOCK_PATH)
+    except OSError as e:
+        log(f"socket bind failed on {SOCK_PATH}: {e}")
+        sock.close()
+        try: PID_FILE.unlink()
+        except OSError: pass
+        sys.exit(1)
+    try:
+        os.chmod(SOCK_PATH, 0o600)
+    except OSError:
+        pass
 
     # Open serial (Arduino resets here — one time only)
     ser, serial_port = open_serial()
@@ -184,6 +258,9 @@ def main():
                 last_reopen_attempt = 0.0
     finally:
         cleanup(sock=sock, ser=ser)
+        # Releasing the flock happens implicitly on process exit when lock_fd closes.
+        try: os.close(lock_fd)
+        except Exception: pass
 
 
 if __name__ == "__main__":

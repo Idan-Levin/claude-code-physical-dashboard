@@ -3,21 +3,21 @@
     "SessionStart": [
       {
         "hooks": [
-          { "type": "command", "command": "~/claude-led-dashboard/.venv/bin/python ~/claude-led-dashboard/claude_led_bridge.py", "async": true }
+          { "type": "command", "command": "$HOME/claude-led-dashboard/.venv/bin/python $HOME/claude-led-dashboard/claude_led_bridge.py", "async": true }
         ]
       }
     ],
     "SessionEnd": [
       {
         "hooks": [
-          { "type": "command", "command": "~/claude-led-dashboard/.venv/bin/python ~/claude-led-dashboard/claude_led_bridge.py", "async": true }
+          { "type": "command", "command": "$HOME/claude-led-dashboard/.venv/bin/python $HOME/claude-led-dashboard/claude_led_bridge.py", "async": true }
         ]
       }
     ],
     "UserPromptSubmit": [
       {
         "hooks": [
-          { "type": "command", "command": "~/claude-led-dashboard/.venv/bin/python ~/claude-led-dashboard/claude_led_bridge.py", "async": true }
+          { "type": "command", "command": "$HOME/claude-led-dashboard/.venv/bin/python $HOME/claude-led-dashboard/claude_led_bridge.py", "async": true }
         ]
       }
     ],
@@ -25,21 +25,21 @@
       {
         "matcher": "",
         "hooks": [
-          { "type": "command", "command": "~/claude-led-dashboard/.venv/bin/python ~/claude-led-dashboard/claude_led_bridge.py", "async": true }
+          { "type": "command", "command": "$HOME/claude-led-dashboard/.venv/bin/python $HOME/claude-led-dashboard/claude_led_bridge.py", "async": true }
         ]
       }
     ],
     "Stop": [
       {
         "hooks": [
-          { "type": "command", "command": "~/claude-led-dashboard/.venv/bin/python ~/claude-led-dashboard/claude_led_bridge.py", "async": true }
+          { "type": "command", "command": "$HOME/claude-led-dashboard/.venv/bin/python $HOME/claude-led-dashboard/claude_led_bridge.py", "async": true }
         ]
       }
     ],
     "Notification": [
       {
         "hooks": [
-          { "type": "command", "command": "~/claude-led-dashboard/.venv/bin/python ~/claude-led-dashboard/claude_led_bridge.py", "async": true }
+          { "type": "command", "command": "$HOME/claude-led-dashboard/.venv/bin/python $HOME/claude-led-dashboard/claude_led_bridge.py", "async": true }
         ]
       }
     ]
