@@ -36,6 +36,11 @@ PID_FILE = STATE_DIR / "daemon.pid"
 LOCK_FILE = STATE_DIR / "daemon.lock"
 LOG_FILE = STATE_DIR / "daemon.log"
 
+# Claude Code's Stop hook does not fire on user interrupt (Ctrl+C / Esc),
+# so after a cancelled turn the LED can get stuck on "working" forever.
+# Revert any slot that has been "working" this long with no new activity.
+WORKING_TIMEOUT = float(os.environ.get("CLAUDE_LED_WORKING_TIMEOUT", "20"))
+
 
 def find_serial_port():
     """Locate the Arduino serial device.
@@ -220,12 +225,38 @@ def main():
     last_reopen_attempt = 0.0
     REOPEN_COOLDOWN = 2.0
 
+    # slot (int) -> (state_name, last_update_ts)
+    slot_state = {}
+
+    def write_cmd(cmd):
+        nonlocal ser, last_reopen_attempt
+        if ser is None:
+            return False
+        try:
+            ser.write((cmd + "\n").encode())
+            ser.flush()
+            return True
+        except (serial.SerialException, OSError) as e:
+            log(f"write error: {e}; closing port, will reopen")
+            try: ser.close()
+            except Exception: pass
+            ser = None
+            last_reopen_attempt = 0.0
+            return False
+
     sock.settimeout(1.0)
     try:
         while not stop["flag"]:
             try:
                 data, _ = sock.recvfrom(256)
             except socket.timeout:
+                # Watchdog: revert slots stuck "working" past the timeout.
+                now = time.time()
+                for s, (st, ts) in list(slot_state.items()):
+                    if st == "working" and now - ts > WORKING_TIMEOUT:
+                        if write_cmd(f"{s}:waiting"):
+                            log(f"watchdog -> {s}:waiting (stuck working > {WORKING_TIMEOUT:.0f}s)")
+                            slot_state[s] = ("waiting", now)
                 continue
             cmd = data.decode(errors="ignore").strip()
             if not cmd:
@@ -245,17 +276,11 @@ def main():
                     log(f"dropped {cmd!r}: reopen failed")
                     continue
 
-            try:
-                ser.write((cmd + "\n").encode())
-                ser.flush()
+            if write_cmd(cmd):
                 log(f"-> {cmd}")
-            except (serial.SerialException, OSError) as e:
-                # Stale FD after USB replug — drop it, next command triggers reopen.
-                log(f"write error: {e}; closing port, will reopen")
-                try: ser.close()
-                except Exception: pass
-                ser = None
-                last_reopen_attempt = 0.0
+                slot_str, sep, state_name = cmd.partition(":")
+                if sep and slot_str.isdigit():
+                    slot_state[int(slot_str)] = (state_name, time.time())
     finally:
         cleanup(sock=sock, ser=ser)
         # Releasing the flock happens implicitly on process exit when lock_fd closes.
