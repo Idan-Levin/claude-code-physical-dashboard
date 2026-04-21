@@ -46,7 +46,9 @@ def find_serial_port():
         if "usbmodem" in dev or "usbserial" in dev or "ttyACM" in dev or "ttyUSB" in dev:
             return dev
 
-    for pattern in ("/dev/tty.usbmodem*", "/dev/tty.usbserial*",
+    # /dev/cu.* first on macOS: /dev/tty.* opens block on DCD carrier detect.
+    for pattern in ("/dev/cu.usbmodem*", "/dev/cu.usbserial*",
+                    "/dev/tty.usbmodem*", "/dev/tty.usbserial*",
                     "/dev/ttyACM*", "/dev/ttyUSB*"):
         hits = sorted(glob.glob(pattern))
         if hits:
@@ -74,8 +76,14 @@ def open_serial():
     except Exception as e:
         log(f"serial open failed on {port}: {e}")
         return None, None
-    time.sleep(2.5)  # Arduino resets on DTR pulse; wait for boot + Serial.begin
-    banner = s.read(200)
+    try:
+        time.sleep(2.5)  # Arduino resets on DTR pulse; wait for boot + Serial.begin
+        banner = s.read(200)
+    except (serial.SerialException, OSError) as e:
+        log(f"serial banner read failed on {port}: {e}")
+        try: s.close()
+        except Exception: pass
+        return None, None
     log(f"serial opened port={port} banner={banner!r}")
     return s, port
 
@@ -155,10 +163,12 @@ def main():
             if ser is None:
                 now = time.time()
                 if now - last_reopen_attempt < REOPEN_COOLDOWN:
+                    log(f"dropped {cmd!r}: serial closed, reopen cooldown")
                     continue
                 last_reopen_attempt = now
                 ser, serial_port = open_serial()
                 if ser is None:
+                    log(f"dropped {cmd!r}: reopen failed")
                     continue
 
             try:
